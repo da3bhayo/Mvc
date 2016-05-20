@@ -4,11 +4,13 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Mvc.ActionConstraints;
 using Microsoft.AspNetCore.Mvc.Core;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.Internal;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.AspNetCore.Mvc.Internal
@@ -18,25 +20,49 @@ namespace Microsoft.AspNetCore.Mvc.Internal
     /// </summary>
     public class ActionSelector : IActionSelector
     {
-        private readonly IActionSelectorDecisionTreeProvider _decisionTreeProvider;
+        private static readonly IReadOnlyList<ActionDescriptor> EmptyActions = Array.Empty<ActionDescriptor>();
+
+        private readonly IActionDescriptorCollectionProvider _actionDescriptorCollectionProvider;
         private readonly ActionConstraintCache _actionConstraintCache;
-        private ILogger _logger;
+        private readonly ILogger _logger;
+
+        private Cache _cache;
 
         /// <summary>
         /// Creates a new <see cref="ActionSelector"/>.
         /// </summary>
-        /// <param name="decisionTreeProvider">The <see cref="IActionSelectorDecisionTreeProvider"/>.</param>
+        /// <param name="actionDescriptorCollectionProvider">
+        /// The <see cref="IActionDescriptorCollectionProvider"/>.
+        /// </param>
         /// <param name="actionConstraintCache">The <see cref="ActionConstraintCache"/> that
         /// providers a set of <see cref="IActionConstraint"/> instances.</param>
         /// <param name="loggerFactory">The <see cref="ILoggerFactory"/>.</param>
         public ActionSelector(
-            IActionSelectorDecisionTreeProvider decisionTreeProvider,
+            IActionDescriptorCollectionProvider actionDescriptorCollectionProvider,
             ActionConstraintCache actionConstraintCache,
             ILoggerFactory loggerFactory)
         {
-            _decisionTreeProvider = decisionTreeProvider;
+            _actionDescriptorCollectionProvider = actionDescriptorCollectionProvider;
             _logger = loggerFactory.CreateLogger<ActionSelector>();
             _actionConstraintCache = actionConstraintCache;
+        }
+
+        private Cache Current
+        {
+            get
+            {
+                var actions = _actionDescriptorCollectionProvider.ActionDescriptors;
+                var cache = Volatile.Read(ref _cache);
+
+                if (cache != null && cache.Version == actions.Version)
+                {
+                    return cache;
+                }
+
+                cache = new Cache(actions);
+                Volatile.Write(ref _cache, cache);
+                return cache;
+            }
         }
 
         public IReadOnlyList<ActionDescriptor> SelectCandidates(RouteContext context)
@@ -46,8 +72,31 @@ namespace Microsoft.AspNetCore.Mvc.Internal
                 throw new ArgumentNullException(nameof(context));
             }
 
-            var tree = _decisionTreeProvider.DecisionTree;
-            return tree.Select(context.RouteData.Values);
+            var cache = Current;
+
+            // The Cache works based on a string[] of the route values in a pre-calculated order. This code extracts
+            // those values in the correct order.
+            var keys = cache.RouteKeys;
+            var values = new string[keys.Length];
+            for (var i = 0; i < keys.Length; i++)
+            {
+                context.RouteData.Values.TryGetValue(keys[i], out object value);
+
+                if (value != null)
+                {
+                    values[i] = value as string ?? Convert.ToString(value);
+                }
+            }
+            
+            if (!cache.OrdinalEntries.TryGetValue(values, out var matchingRouteValues))
+            {
+                if (!cache.OrdinalIgnoreCaseEntries.TryGetValue(values, out matchingRouteValues))
+                {
+                    _logger.NoActionsMatched(context.RouteData.Values);
+                }
+            }
+
+            return matchingRouteValues ?? EmptyActions;
         }
 
         public ActionDescriptor SelectBestCandidate(RouteContext context, IReadOnlyList<ActionDescriptor> candidates)
@@ -232,6 +281,178 @@ namespace Microsoft.AspNetCore.Mvc.Internal
             else
             {
                 return EvaluateActionConstraintsCore(context, actionsWithoutConstraint, order);
+            }
+        }
+
+        // The action selector cache stores a mapping of route-values -> action descriptors for each 'known' set of
+        // of route-values. We actually build two of these mappings, one for case-sensitive (fast path) and one for
+        // case-insensitive (slow path).
+        //
+        // This is necessary because MVC routing/action-selection is always case-insensitive. So we're going to build
+        // a case-sensitive dictionary that will behave like the a case-insensitive dictionary when you hit one of the
+        // canonical entries. When you don't hit a case-sensitive match it will try the case-insensitive dictionary
+        // so you still get correct bheaviors.
+        //
+        // The difference here is because while MVC is case-insensitive, doing a case-sensitive comparison is much 
+        // faster. We also expect that most of the URLs we process are canonically-cased because they were generated
+        // by Url.Action or another routing api.
+        //
+        // This means that for a set of actions like:
+        //      { controller = "Home", action = "Index" } -> HomeController::Index1()
+        //      { controller = "Home", action = "index" } -> HomeController::Index2()
+        //
+        // Both of these actions match "Index" case-insensitively, but there exist two known canonical casings,
+        // so we will create an entry for "Index" and an entry for "index". Both of these entries match **both**
+        // actions.
+        private class Cache
+        {
+            public Cache(ActionDescriptorCollection actions)
+            {
+                // We need to store the version so the cache can be invalidated if the actions change.
+                Version = actions.Version;
+
+                // We need to build two maps for all of the route values.
+                OrdinalEntries = new Dictionary<string[], List<ActionDescriptor>>(StringArrayComparer.Ordinal);
+                OrdinalIgnoreCaseEntries = new Dictionary<string[], List<ActionDescriptor>>(StringArrayComparer.OrdinalIgnoreCase);
+
+                // We need to first identify of the keys that action selection will look at (in route data). 
+                // We want to only consider conventionally routed actions here.
+                var conventionallyRoutedActions = 0;
+                var routeKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i < actions.Items.Count; i++)
+                {
+                    var action = actions.Items[i];
+                    if (action.AttributeRouteInfo == null)
+                    {
+                        // This is a conventionally routed action - so make sure we include its 'keys' in the set of
+                        // known route value keys.
+                        conventionallyRoutedActions++;
+
+                        foreach (var kvp in action.RouteValues)
+                        {
+                            routeKeys.Add(kvp.Key);
+                        }
+                    }
+                }
+
+                // We need to hold on to an ordered set of 'keys' for the route values. We'll use these later to
+                // extract the set of route values from an incoming request to compare against our maps of known
+                // route values.
+                RouteKeys = routeKeys.ToArray();
+
+                var actionsAndKeys = new (ActionDescriptor action, string[] keys)[conventionallyRoutedActions];
+
+                var count = 0;
+                for (var i = 0; i < actions.Items.Count; i++)
+                {
+                    var action = actions.Items[i];
+                    if (action.AttributeRouteInfo == null)
+                    {
+                        // This is a conventionally routed action - so we need to extract the route values associated
+                        // with this action (in order) so we can store them in our maps.
+                        var values = new string[RouteKeys.Length];
+                        for (var j = 0; j < RouteKeys.Length; j++)
+                        {
+                            action.RouteValues.TryGetValue(RouteKeys[j], out values[j]);
+                        }
+
+                        actionsAndKeys[count++] = (action, values);
+                        
+                        if (!OrdinalIgnoreCaseEntries.TryGetValue(values, out var entries))
+                        {
+                            entries = new List<ActionDescriptor>();
+                            OrdinalIgnoreCaseEntries.Add(values, entries);
+                        }
+
+                        entries.Add(action);
+                    }
+                }
+
+                // At this point `OrdinalIgnoreCaseEntries[key].Value` contains all of the actions in the same
+                // equivalence class - meaning, all conventionally routed actions for which the route values are equal
+                // ignoring case.
+                //
+                // Now we want to iterate the actions **again** and for each unique casing, map this back to the full
+                // set for that equivalence class.
+                for (var i = 0; i < actionsAndKeys.Length; i++)
+                {
+                    var actionAndKeys = actionsAndKeys[i];
+                    if (!OrdinalEntries.ContainsKey(actionAndKeys.keys))
+                    {
+                        OrdinalEntries[actionAndKeys.keys] = OrdinalIgnoreCaseEntries[actionAndKeys.keys];
+                    }
+                }
+            }
+
+            public int Version { get; set; }
+
+            public string[] RouteKeys { get; set; }
+
+            public Dictionary<string[], List<ActionDescriptor>> OrdinalEntries { get; set; }
+
+            public Dictionary<string[], List<ActionDescriptor>> OrdinalIgnoreCaseEntries { get; set; }
+        }
+
+        private class StringArrayComparer : IEqualityComparer<string[]>
+        {
+            public static readonly StringArrayComparer Ordinal = new StringArrayComparer(StringComparer.Ordinal);
+
+            public static readonly StringArrayComparer OrdinalIgnoreCase = new StringArrayComparer(StringComparer.OrdinalIgnoreCase);
+
+            private readonly StringComparer _valueComparer;
+
+            private StringArrayComparer(StringComparer valueComparer)
+            {
+                _valueComparer = valueComparer;
+            }
+
+            public bool Equals(string[] x, string[] y)
+            {
+                if (object.ReferenceEquals(x, y))
+                {
+                    return true;
+                }
+
+                if (x == null ^ y == null)
+                {
+                    return false;
+                }
+
+                if (x.Length != y.Length)
+                {
+                    return false;
+                }
+
+                for (var i = 0; i < x.Length; i++)
+                {
+                    if (string.IsNullOrEmpty(x[i]) && string.IsNullOrEmpty(y[i]))
+                    {
+                        continue;
+                    }
+
+                    if (!_valueComparer.Equals(x[i], y[i]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            public int GetHashCode(string[] obj)
+            {
+                if (obj == null)
+                {
+                    return 0;
+                }
+
+                var hash = new HashCodeCombiner();
+                for (var i = 0; i < obj.Length; i++)
+                {
+                    hash.Add(obj[i], _valueComparer);
+                }
+
+                return hash.CombinedHash;
             }
         }
     }
